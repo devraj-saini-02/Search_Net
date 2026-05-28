@@ -87,6 +87,54 @@ def _hf_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+async def _hf_post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: Dict[str, Any],
+    max_retries: int = 3,
+    backoff: float = 5.0,
+) -> httpx.Response:
+    """
+    POST to a HF Inference endpoint with retry + exponential backoff.
+
+    Retries on:
+      - ConnectError / DNS failures  ([Errno 11001] getaddrinfo failed on Windows)
+      - HTTP 503 (model loading / cold start — very common on free HF tier)
+      - HTTP 429 (rate limited)
+
+    Raises the final exception if all retries are exhausted.
+    """
+    import asyncio
+
+    last_exc: Exception = RuntimeError("No attempts made.")
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = await client.post(
+                url, json=payload, headers=_hf_headers(), timeout=90.0
+            )
+            # Retry on HF cold-start (503) and rate-limit (429)
+            if resp.status_code in (429, 503):
+                wait = backoff * attempt
+                logger.warning(
+                    "HF API returned %d on attempt %d — retrying in %.0fs …",
+                    resp.status_code, attempt, wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            wait = backoff * attempt
+            logger.warning(
+                "HF network error on attempt %d/%d: %s — retrying in %.0fs …",
+                attempt, max_retries, exc, wait,
+            )
+            last_exc = exc
+            await asyncio.sleep(wait)
+
+    raise last_exc
+
+
 def _llm_call_payload(prompt: str, max_new_tokens: int = 512) -> Dict[str, Any]:
     """Shared Llama-3 inference payload factory."""
     return {
@@ -248,13 +296,9 @@ Biography context (use only as reference — do not copy verbatim):
     fallback_summary = f"{name} — {('fictional character' if is_fictional else 'notable individual')}."
 
     try:
-        resp = await client.post(
-            HF_LLM_URL,
-            json=_llm_call_payload(prompt, max_new_tokens=512),
-            headers=_hf_headers(),
-            timeout=90.0,
+        resp = await _hf_post_with_retry(
+            client, HF_LLM_URL, _llm_call_payload(prompt, max_new_tokens=512)
         )
-        resp.raise_for_status()
         raw: str = resp.json()[0]["generated_text"].strip()
         parsed = _extract_json(raw)
 
@@ -284,13 +328,9 @@ async def embed_text(text: str, client: httpx.AsyncClient) -> List[float]:
 
     Raises on failure — embeddings are mandatory for an entity to be stored.
     """
-    resp = await client.post(
-        HF_EMBED_URL,
-        json={"inputs": text},
-        headers=_hf_headers(),
-        timeout=45.0,
+    resp = await _hf_post_with_retry(
+        client, HF_EMBED_URL, {"inputs": text}
     )
-    resp.raise_for_status()
     result = resp.json()
 
     # Unwrap batch dimension: [[f1, f2, …]] → [f1, f2, …]
@@ -430,13 +470,9 @@ If nothing qualifies, return an empty object for metadata_filters."""
     fallback = (prompt, {"is_fictional": None, "metadata_filters": {}})
 
     try:
-        resp = await client.post(
-            HF_LLM_URL,
-            json=_llm_call_payload(prompt_str, max_new_tokens=200),
-            headers=_hf_headers(),
-            timeout=30.0,
+        resp = await _hf_post_with_retry(
+            client, HF_LLM_URL, _llm_call_payload(prompt_str, max_new_tokens=200)
         )
-        resp.raise_for_status()
         raw: str = resp.json()[0]["generated_text"].strip()
         parsed = _extract_json(raw)
 
@@ -512,7 +548,15 @@ async def run_etl_pipeline(items: List[IngestItem], is_fictional: bool) -> None:
     )
     async with httpx.AsyncClient(
         follow_redirects=True,
-        headers={"User-Agent": "SearchEngine-ETL/1.0"},
+        headers={
+            # Wikipedia requires a descriptive User-Agent with a contact method.
+            # A generic string like "python-httpx" gets 403'd automatically.
+            "User-Agent": (
+                "SearchEngine-ETL/1.0 "
+                "(https://github.com/devraj-saini-02/Search_Net; devraj.saini.ug23@nsut.ac.in) "
+                "python-httpx"
+            )
+        },
     ) as client:
         for item in items:
             try:
