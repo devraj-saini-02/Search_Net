@@ -15,13 +15,16 @@ import secrets
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
 # Single shared security scheme instance (reused across all endpoints)
 security = HTTPBasic()
 
 # Credentials stored in process memory only
-_ADMIN_USERNAME: str = "admin_architect"
-_ADMIN_PASSWORD: str = "unbreakable_secure_hash"
+_ADMIN_USERNAME: str = os.getenv("ADMIN_USERNAME")
+_ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD")
 
 
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)) -> None:
